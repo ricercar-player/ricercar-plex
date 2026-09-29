@@ -1,0 +1,22 @@
+# Entry for the ricercar plugin hub (github.com/ricercar-player/ricercar-plugins),
+# to publish as plugins/plex.toml. On a release, update `version`, the
+# URLs and the SHA-256 from the release's .sha256 files.
+id = "plex"
+name = "Plex"
+description = "Browse, search and play the music of your own Plex Media Server. Albums, artists, playlists and favourites, merged into your library; plays show on the server. Original files, bit for bit; FLAC at a rate your DAC takes when it cannot play the file's."
+author = "ricercar-player"
+license = "MIT"
+repository = "https://github.com/ricercar-player/ricercar-plex"
+version = "0.1.0"
+protocol = 1
+capabilities = ["auth", "browse", "search", "resolve", "favorites", "reporting", "library"]
+
+[[assets]]
+arch = "x86_64"
+url = "https://github.com/ricercar-player/ricercar-plex/releases/download/v0.1.0/plex-x86_64"
+sha256 = "0000000000000000000000000000000000000000000000000000000000000000"
+
+[[assets]]
+arch = "aarch64"
+url = "https://github.com/ricercar-player/ricercar-plex/releases/download/v0.1.0/plex-aarch64"
+sha256 = "0000000000000000000000000000000000000000000000000000000000000000"
