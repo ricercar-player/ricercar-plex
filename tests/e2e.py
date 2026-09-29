@@ -65,23 +65,34 @@ check(a["token"] == "test-token" and a["server"] == "http://127.0.0.1:32400" and
 
 root = p.call("browse.root")
 check([x["ref"] for x in root["sections"]] == ["recent", "albums", "artists", "playlists", "favorites", "frequent"], "root sections")
+check([x["ref"] for x in root["home"]] == ["recent", "played", "top"] and all(x["browsable"] for x in root["home"]), "home shelves")
 al = p.call("browse.list", {"ref": "albums", "offset": 0, "limit": 50}); names = [x["title"] for x in al["items"]]
-check(names == ["DSDish", "HiRes", "Sessions"] and al["total"] == 3, "albums " + str(names))
+check(names == ["DSDish", "HiRes", "Sessions", "Solo"] and al["total"] == 4, "albums of both libraries " + str(names))
 sess = [x for x in al["items"] if x["title"] == "Sessions"][0]
 check(sess["artist"] == "Ensemble" and sess["year"] == 2021 and sess["art"].startswith(PMS + "/photo/:/transcode?X-Plex-Token=test-token"), "album fields")
 check(urllib.request.urlopen(sess["art"]).headers.get("Content-Type") == "image/jpeg", "cover url serves a jpeg")
-rec = p.call("browse.list", {"ref": "recent", "offset": 0, "limit": 1}); check(len(rec["items"]) == 1 and rec["has_more"], "recent, paged")
+rec = p.call("browse.list", {"ref": "recent", "offset": 0, "limit": 1})
+check([x["title"] for x in rec["items"]] == ["Solo"] and rec["has_more"], "recently added, across libraries, paged")
 tr = p.call("browse.list", {"ref": sess["ref"], "offset": 0, "limit": 200})
 check([t["track_no"] for t in tr["items"]] == [1, 2, 3] and tr["items"][0]["format"]["codec"] == "flac", "album tracks")
 pg = p.call("browse.list", {"ref": sess["ref"], "offset": 1, "limit": 1}); check(len(pg["items"]) == 1 and pg["has_more"] and pg["total"] == 3, "paging")
-ar = p.call("browse.list", {"ref": "artists", "offset": 0, "limit": 50}); check(sorted(x["title"] for x in ar["items"]) == ["Ensemble", "Trio"], "artists")
+ar = p.call("browse.list", {"ref": "artists", "offset": 0, "limit": 50}); check(sorted(x["title"] for x in ar["items"]) == ["Ensemble", "Soloist", "Trio"], "artists")
 tri = [x for x in ar["items"] if x["title"] == "Trio"][0]
 check([x["title"] for x in p.call("browse.list", {"ref": tri["ref"], "offset": 0, "limit": 10})["items"]] == ["HiRes", "DSDish"], "artist albums, newest first")
 sr = p.call("search", {"query": "hi", "offset": 0, "limit": 10}); g = {x["kind"]: len(x["items"]) for x in sr["groups"]}
 check(g == {"artist": 0, "album": 1, "track": 2, "playlist": 0}, "search " + str(g))
+sr = p.call("search", {"query": "SOLO", "offset": 0, "limit": 10}); g = {x["kind"]: [i["title"] for i in x["items"]] for x in sr["groups"]}
+check(g == {"artist": ["Soloist"], "album": ["Solo"], "track": [], "playlist": []}, "search groups " + str(g))
 check(len(p.call("search", {"query": "TRACK", "kinds": ["track"], "offset": 0, "limit": 10})["groups"][0]["items"]) == 3, "search tracks only, any case")
-for m, exp in (("library.albums", 3), ("library.artists", 2), ("library.tracks", 6)):
+for m, exp in (("library.albums", 4), ("library.artists", 3), ("library.tracks", 7)):
     r = p.call(m, {"offset": 0, "limit": 200}); check(len(r["items"]) == exp and r["total"] == exp, "%s: %d" % (m, len(r["items"])))
+la = p.call("library.albums", {"offset": 0, "limit": 200})["items"]
+check(all(x["kind"] == "album" and x["browsable"] and x.get("artist") and x.get("year") and x.get("art") for x in la), "library albums: artist, year, art")
+lr = p.call("library.artists", {"offset": 0, "limit": 200})["items"]
+check(all(x["kind"] == "artist" and x["browsable"] and x.get("art") for x in lr), "library artists: art (album cover when none) " + str([x["title"] for x in lr if not x.get("art")]))
+solo = [x for x in lr if x["title"] == "Soloist"][0]
+check([x["title"] for x in p.call("browse.list", {"ref": solo["ref"], "offset": 0, "limit": 10})["items"]] == ["Solo"], "library artist -> its albums")
+check(p.call("library.playlists", {"offset": 0, "limit": 200}) == {"items": [], "total": 0, "has_more": False}, "library.playlists, none yet")
 t1 = tr["items"][0]; it = p.call("item.get", {"ref": t1["ref"]})
 check(it["title"] == "Track 1" and it["format"] == {"sample_rate": 44100, "bits": 16, "channels": 1, "codec": "flac"}, "item.get track, with format")
 check(p.call("item.get", {"ref": "t/999999"}).get("code") == -32002, "item.get missing -> not_found")
@@ -91,9 +102,13 @@ mid = pms("/identity")["machineIdentifier"]; pl_ids = ",".join(x["ref"][2:] for 
 urllib.request.urlopen(urllib.request.Request(f"{PMS}/playlists?type=audio&title=Road%20Mix&smart=0&uri=server://{mid}/com.plexapp.plugins.library/library/metadata/{pl_ids}", method="POST"))
 pls = p.call("browse.list", {"ref": "playlists", "offset": 0, "limit": 50}); mix = [x for x in pls["items"] if x["title"] == "Road Mix"]
 check(len(mix) == 1 and mix[0]["subtitle"] == "2 ♪", "playlists")
+lp = p.call("library.playlists", {"offset": 0, "limit": 200})
+check([(x["ref"], x["kind"], x["browsable"]) for x in lp["items"]] == [(mix[0]["ref"], "playlist", True)] and lp["total"] == 1 and not lp["has_more"], "library.playlists")
 check(len(p.call("browse.list", {"ref": mix[0]["ref"], "offset": 0, "limit": 50})["items"]) == 2, "playlist tracks")
 check(p.call("item.get", {"ref": mix[0]["ref"]})["kind"] == "playlist", "item.get playlist")
 check([x["title"] for x in p.call("search", {"query": "road", "kinds": ["playlist"], "offset": 0, "limit": 5})["groups"][0]["items"]] == ["Road Mix"], "search playlists")
+sr = p.call("search", {"query": "Mix", "offset": 0, "limit": 5}); g = {x["kind"]: [i["title"] for i in x["items"]] for x in sr["groups"]}
+check(g["playlist"] == ["Road Mix"] and g["artist"] == [], "search, all groups: playlist found")
 # favourites
 check(p.call("favorites.set", {"ref": t1["ref"], "on": True}) is None, "rate track")
 check(p.call("favorites.set", {"ref": sess["ref"], "on": True}) is None, "rate album")
@@ -136,6 +151,9 @@ p.notify("playback.started", {"ref": t2["ref"]}); time.sleep(0.5)
 p.notify("playback.ended", {"ref": t2["ref"], "listened_ms": 3000, "reason": "skipped"}); time.sleep(1)
 check(vc(t2["ref"]) == b2, "short skip not counted")
 fr = p.call("browse.list", {"ref": "frequent", "offset": 0, "limit": 10}); check(t3["ref"] in [x["ref"] for x in fr["items"]], "most played")
+for shelf in ("played", "top"):
+    sh = p.call("browse.list", {"ref": shelf, "offset": 0, "limit": 10})
+    check(sh["items"] and sh["items"][0]["ref"] == sess["ref"] and all(x["kind"] == "album" for x in sh["items"]), "home shelf %s: %s" % (shelf, [x["title"] for x in sh["items"]]))
 p.call("shutdown")
 # restart: session restored
 p = P(); p.call("initialize", {"protocol": 1, "data_dir": DATA, "locale": "en", "output": OUT})
@@ -145,8 +163,10 @@ a = json.load(open(DATA + "/auth.json")); a["server"] = "http://127.0.0.1:9"; a[
 json.dump(a, open(DATA + "/auth.json", "w")); p.call("shutdown")
 p = P(); p.call("initialize", {"protocol": 1, "data_dir": DATA, "output": OUT})
 r = p.call("browse.list", {"ref": "albums", "offset": 0, "limit": 5})
-check(len(r.get("items", [])) == 3 and json.load(open(DATA + "/auth.json"))["server"] == "http://127.0.0.1:32400", "dead address -> other connection")
+check(len(r.get("items", [])) == 4 and json.load(open(DATA + "/auth.json"))["server"] == "http://127.0.0.1:32400", "dead address -> other connection")
 check(p.call("auth.sign_out") is None and not os.path.exists(DATA + "/auth.json") and p.call("auth.status")["state"] == "signed_out", "sign out")
 check(p.call("nope").get("code") == -32601, "unknown method")
-p.call("shutdown")
+p.call("shutdown"); time.sleep(0.5)
+log = open(S + "/plugin.log").read()
+check("test-token" not in log and "signed in as" not in log, "no token or account name in the log")
 print("FAILURES:", bad); sys.exit(1 if bad else 0)

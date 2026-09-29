@@ -6,7 +6,12 @@ music of your own [Plex Media Server](https://www.plex.tv).
 - **Browse:** recently added, albums, artists, playlists, favourites and
   most played, across all the music libraries of the server.
 - **Library:** your server's albums, artists and tracks join ricercar's own
-  Albums, Artists and Tracks pages and its search, marked *Plex*.
+  Albums, Artists and Tracks pages and its search, marked *Plex*; your
+  audio playlists join its Playlists. Artists without a picture on the
+  server get the cover of one of their albums.
+- **Home:** recently added, recently played and most played albums, as
+  shelves on ricercar's Home page. With several music libraries on the
+  server, each shelf mixes them.
 - **Search:** artists, albums, tracks and playlists.
 - **Bit-perfect:** tracks play from the original file, byte for byte
   (seekable). Only when your DAC cannot take a file's sample rate does the
@@ -85,11 +90,13 @@ Signing in from another computer than the one running ricercar: paste
 
 Plugin protocol 1, as described in ricercar's
 [docs/plugins.md](https://github.com/ricercar-player/ricercar/blob/main/docs/plugins.md),
-with the `library` capability.
+with the `library` capability (`library.albums`, `library.artists`,
+`library.tracks`, `library.playlists`) and `home` shelves.
 
 | Ref | Meaning |
 |---|---|
 | `recent`, `albums`, `artists`, `playlists`, `favorites`, `frequent` | Top-level sections |
+| `recent`, `played`, `top` | Home shelves: albums recently added, recently played, most played |
 | `t/<ratingKey>` | Track |
 | `a/<ratingKey>` | Album |
 | `r/<ratingKey>` | Artist (its albums) |

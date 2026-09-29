@@ -3,7 +3,7 @@
 # URLs and the SHA-256 from the release's .sha256 files.
 id = "plex"
 name = "Plex"
-description = "Browse, search and play the music of your own Plex Media Server. Albums, artists, playlists and favourites, merged into your library; plays show on the server. Original files, bit for bit; FLAC at a rate your DAC takes when it cannot play the file's."
+description = "Browse, search and play the music of your own Plex Media Server. Albums, artists and playlists merged into your library, recent albums on Home, favourites shared with Plex; plays show on the server. Original files, bit for bit; FLAC at a rate your DAC takes when it cannot play the file's."
 author = "ricercar-player"
 license = "MIT"
 repository = "https://github.com/ricercar-player/ricercar-plex"

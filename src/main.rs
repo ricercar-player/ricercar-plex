@@ -146,12 +146,8 @@ impl Plugin {
 
     fn store(&self, s: Session) {
         self.save(&s);
-        eprintln!(
-            "signed in as {} on {} ({})",
-            if s.user.is_empty() { "?" } else { &s.user },
-            s.server_name,
-            s.server
-        );
+        // Never the account's name or email: logs get pasted in bug reports.
+        eprintln!("signed in to {} ({})", s.server_name, s.server);
         *self.session.lock().unwrap() = Some(s);
         *self.expired.lock().unwrap() = false;
         *self.login_error.lock().unwrap() = None;
@@ -440,7 +436,56 @@ impl Plugin {
                 |(r, title)| json!({"ref": r, "kind": "folder", "title": title, "browsable": true}),
             )
             .collect();
-        Ok(json!({ "sections": sections }))
+        // Shelves of the host's Home page: albums, across every music
+        // library of the server (`/library/all` merges and sorts them).
+        let home = [
+            ("recent", t("Recently added", "Ajouts récents")),
+            ("played", t("Recently played", "Écoutés récemment")),
+            ("top", t("Most played", "Les plus écoutés")),
+        ];
+        let home: Vec<Value> = home
+            .iter()
+            .map(
+                |(r, title)| json!({"ref": r, "kind": "folder", "title": title, "browsable": true}),
+            )
+            .collect();
+        Ok(json!({ "sections": sections, "home": home }))
+    }
+
+    /// The user's audio playlists (smart ones included).
+    fn playlists(&self, offset: u64, limit: u64) -> Reply {
+        let q = [("playlistType", "audio".to_string())];
+        self.listing("/playlists", &q, offset, limit, items::playlist)
+    }
+
+    /// Artists without a picture of their own (no online metadata agent)
+    /// get the cover of one of their albums, in one request per page.
+    fn artist_art(&self, s: &Session, list: &mut [Value]) {
+        let bare: Vec<&str> = list
+            .iter()
+            .filter(|a| a["type"] == "artist" && !a["thumb"].is_string())
+            .filter_map(|a| a["ratingKey"].as_str())
+            .collect();
+        if bare.is_empty() {
+            return;
+        }
+        let q = [("type", "9".to_string()), ("artist.id", bare.join(","))];
+        let albums = match self.client.page(s, "/library/all", &q, 0, 5000) {
+            Ok(pg) => pg.items,
+            Err(e) => {
+                eprintln!("artist covers: {e}");
+                return;
+            }
+        };
+        for a in list.iter_mut().filter(|a| !a["thumb"].is_string()) {
+            let thumb = albums
+                .iter()
+                .filter(|al| al["parentRatingKey"] == a["ratingKey"])
+                .find_map(|al| al["thumb"].as_str());
+            if let Some(t) = thumb {
+                a["thumb"] = t.into();
+            }
+        }
     }
 
     /// One page of a server list, mapped with `f`.
@@ -452,7 +497,8 @@ impl Plugin {
         limit: u64,
         f: fn(&Session, &Value) -> Option<Value>,
     ) -> Reply {
-        let (s, pg) = self.page(path, q, offset, limit)?;
+        let (s, mut pg) = self.page(path, q, offset, limit)?;
+        self.artist_art(&s, &mut pg.items);
         let got = pg.items.len() as u64;
         let list = items::many(&s, &pg.items, f);
         let has_more = match pg.total {
@@ -485,7 +531,8 @@ impl Plugin {
     fn all_of(&self, kind: u8, extra: &[(&str, String)], max: u64) -> Result<Vec<Value>, RpcError> {
         let mut q = vec![("type", kind.to_string())];
         q.extend(extra.iter().cloned());
-        let (s, pg) = self.page("/library/all", &q, 0, max)?;
+        let (s, mut pg) = self.page("/library/all", &q, 0, max)?;
+        self.artist_art(&s, &mut pg.items);
         Ok(items::many(&s, &pg.items, items::any))
     }
 
@@ -506,6 +553,15 @@ impl Plugin {
             }
             "albums" => return self.all(9, &[by_title()], offset, limit, items::album),
             "artists" => return self.all(8, &[by_title()], offset, limit, items::artist),
+            "played" | "top" => {
+                let sort = if r == "played" {
+                    "lastViewedAt:desc"
+                } else {
+                    "viewCount:desc"
+                };
+                let q = [("viewCount>>", "0".to_string()), ("sort", sort.to_string())];
+                return self.all(9, &q, offset, limit, items::album);
+            }
             "frequent" => {
                 let q = [
                     ("sort", "viewCount:desc".to_string()),
@@ -513,10 +569,7 @@ impl Plugin {
                 ];
                 return self.all(10, &q, offset, limit, items::track);
             }
-            "playlists" => {
-                let q = [("playlistType", "audio".to_string())];
-                return self.listing("/playlists", &q, offset, limit, items::playlist);
-            }
+            "playlists" => return self.playlists(offset, limit),
             "favorites" => {
                 // Rated five stars (10 on Plex's 0-10 scale). In Plex
                 // queries, `field>>=value` means "greater than".
@@ -572,7 +625,7 @@ impl Plugin {
                     .collect()
             })
             .unwrap_or_else(|| {
-                ["artist", "album", "track", "playlist"]
+                ["artist", "album", "playlist", "track"]
                     .map(String::from)
                     .to_vec()
             });
@@ -581,7 +634,7 @@ impl Plugin {
             return Ok(json!({ "groups": [] }));
         }
         let mut groups = Vec::new();
-        for kind in ["artist", "album", "track", "playlist"] {
+        for kind in ["artist", "album", "playlist", "track"] {
             if !wanted.iter().any(|w| w == kind) {
                 continue;
             }
@@ -656,6 +709,7 @@ impl Plugin {
         match method {
             "library.albums" => self.all(9, &q, offset, limit, items::album),
             "library.artists" => self.all(8, &q, offset, limit, items::artist),
+            "library.playlists" => self.playlists(offset, limit),
             _ => self.all(10, &q, offset, limit, items::track),
         }
     }
@@ -860,7 +914,9 @@ impl Plugin {
             "search" => self.search(p),
             "item.get" => self.item_get(p),
             "favorites.set" => self.favorite(p),
-            "library.albums" | "library.artists" | "library.tracks" => self.library(method, p),
+            "library.albums" | "library.artists" | "library.tracks" | "library.playlists" => {
+                self.library(method, p)
+            }
             "track.resolve" => self.resolve(p),
             _ => Err(rpc_err(-32601, format!("method not found: {method}"))),
         }

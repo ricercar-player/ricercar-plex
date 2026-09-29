@@ -251,7 +251,7 @@ impl Client {
                 let msg: String = strip_tags(&text).chars().take(200).collect();
                 Err(Error::Status(code, msg.trim().to_string()))
             }
-            Err(e) => Err(Error::Network(e.to_string())),
+            Err(ureq::Error::Transport(t)) => Err(Error::Network(transport(&t))),
         }
     }
 
@@ -477,6 +477,28 @@ pub fn resources(v: &Value, account_token: &str) -> Vec<Resource> {
         })
         .collect();
     out.sort_by_key(|r| !r.owned);
+    out
+}
+
+/// A transport failure without the query string of its URL (search terms
+/// end up in logs and in the host's messages otherwise).
+fn transport(t: &ureq::Transport) -> String {
+    let mut out = String::new();
+    if let Some(u) = t.url() {
+        out.push_str(&format!(
+            "{}{}: ",
+            u.origin().ascii_serialization(),
+            u.path()
+        ));
+    }
+    out.push_str(&t.kind().to_string());
+    if let Some(m) = t.message() {
+        out.push_str(": ");
+        out.push_str(m);
+    }
+    if let Some(src) = std::error::Error::source(t) {
+        out.push_str(&format!(": {src}"));
+    }
     out
 }
 
