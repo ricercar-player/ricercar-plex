@@ -143,6 +143,7 @@ pub fn album(s: &Session, v: &Value) -> Option<Value> {
         "album": title,
         "year": year,
         "genre": genre(v),
+        "track_count": num(v, "leafCount"),
         "browsable": true,
     });
     Some(finish(s, text(v, "thumb"), it))
@@ -176,6 +177,7 @@ pub fn playlist(s: &Session, v: &Value) -> Option<Value> {
         "kind": "playlist",
         "title": text(v, "title").unwrap_or_else(|| "?".into()),
         "subtitle": v["leafCount"].as_i64().map(|n| format!("{n} ♪")),
+        "track_count": v["leafCount"].as_i64(),
         "browsable": true,
     });
     let thumb = text(v, "thumb").or_else(|| text(v, "composite"));
@@ -392,10 +394,11 @@ mod tests {
         let a = album(
             &s,
             &json!({"ratingKey": "2", "type": "album", "title": "Sessions",
-                    "parentTitle": "Ensemble", "year": 2021}),
+                    "parentTitle": "Ensemble", "year": 2021, "leafCount": 9}),
         )
         .unwrap();
         assert_eq!(a["subtitle"], "Ensemble · 2021");
+        assert_eq!(a["track_count"], 9);
         assert_eq!(a["browsable"], true);
         let r = artist(
             &s,
@@ -411,6 +414,7 @@ mod tests {
         )
         .unwrap();
         assert_eq!(p["subtitle"], "12 ♪");
+        assert_eq!(p["track_count"], 12);
         assert!(p["art"].is_string());
         let video = json!({"ratingKey": "13", "type": "playlist", "playlistType": "video"});
         assert!(playlist(&s, &video).is_none());

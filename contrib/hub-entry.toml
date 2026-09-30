@@ -7,16 +7,16 @@ description = "Browse, search and play the music of your own Plex Media Server. 
 author = "ricercar-player"
 license = "MIT"
 repository = "https://github.com/ricercar-player/ricercar-plex"
-version = "0.2.0"
+version = "0.2.1"
 protocol = 1
 capabilities = ["auth", "browse", "search", "resolve", "favorites", "reporting", "library"]
 
 [[assets]]
 arch = "x86_64"
-url = "https://github.com/ricercar-player/ricercar-plex/releases/download/v0.2.0/plex-x86_64"
+url = "https://github.com/ricercar-player/ricercar-plex/releases/download/v0.2.1/plex-x86_64"
 sha256 = "0054f48585da595433f4bea9a9521a7fe7629b07d83ad1e90a5c9d85ade0c308"
 
 [[assets]]
 arch = "aarch64"
-url = "https://github.com/ricercar-player/ricercar-plex/releases/download/v0.2.0/plex-aarch64"
+url = "https://github.com/ricercar-player/ricercar-plex/releases/download/v0.2.1/plex-aarch64"
 sha256 = "bbfd51b5a711d16988913be03ee344d5025d8101c4c7840815c19f18f599c3ee"
