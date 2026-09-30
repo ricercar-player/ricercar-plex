@@ -1,16 +1,31 @@
 //! Plex metadata → ricercar items, and whether the DAC takes a file.
 //!
 //! Refs are `<prefix>/<ratingKey>`: `t` track, `a` album, `r` artist, `p`
-//! playlist. Top-level sections use bare words (`albums`, `artists`…).
+//! playlist; and lists about an item: `sim` similar artists or albums,
+//! `sonic` sonically similar tracks, `radio` a radio. Top-level sections
+//! use bare words (`albums`, `artists`…).
+
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use serde_json::{Value, json};
 
 use crate::plex::Session;
 
+/// Labels in French (the host's `locale`), for item actions.
+static FRENCH: AtomicBool = AtomicBool::new(false);
+
+pub fn set_french(on: bool) {
+    FRENCH.store(on, Ordering::Relaxed);
+}
+
+pub fn french() -> bool {
+    FRENCH.load(Ordering::Relaxed)
+}
+
 /// Kind prefix and rating key of a ref. Rating keys are numbers.
 pub fn split_ref(r: &str) -> Option<(&str, &str)> {
     let (k, id) = r.split_once('/')?;
-    let ok = matches!(k, "t" | "a" | "r" | "p")
+    let ok = matches!(k, "t" | "a" | "r" | "p" | "sim" | "sonic" | "radio")
         && !id.is_empty()
         && id.len() <= 20
         && id.bytes().all(|b| b.is_ascii_digit());
@@ -36,6 +51,59 @@ fn join(parts: &[Option<String>]) -> Option<String> {
 
 fn genre(v: &Value) -> Option<String> {
     v["Genre"][0]["tag"].as_str().map(str::to_string)
+}
+
+/// `<prefix>/<key>` from a rating key field (`parentRatingKey`…).
+fn key_ref(prefix: &str, v: &Value, k: &str) -> Option<String> {
+    let id = match &v[k] {
+        Value::String(s) => s.clone(),
+        Value::Number(n) => n.to_string(),
+        _ => return None,
+    };
+    split_ref(&format!("{prefix}/{id}")).map(|_| format!("{prefix}/{id}"))
+}
+
+/// Rated above four and a half stars (9 on Plex's 0-10 scale): what
+/// `favorites.set` sets and the Favourites section lists. Unrated items
+/// have no `userRating`.
+fn favorite(v: &Value) -> bool {
+    v["userRating"].as_f64().is_some_and(|r| r > 9.0)
+}
+
+/// Lists about an item offered in its menu: similar artists or albums,
+/// sonically similar tracks, an artist radio.
+pub fn actions(kind: &str, id: &str, fr: bool) -> Value {
+    let t = |en: &'static str, f: &'static str| if fr { f } else { en };
+    let act = |id_: &str, label: &str, prefix: &str, kind: &str| json!({"id": id_, "label": label, "ref": format!("{prefix}/{id}"), "kind": kind});
+    match kind {
+        "track" => json!([act(
+            "sonic",
+            t("Sonically similar tracks", "Titres au son proche"),
+            "sonic",
+            "play"
+        )]),
+        "album" => json!([act(
+            "similar",
+            t("Similar albums", "Albums similaires"),
+            "sim",
+            "browse"
+        )]),
+        "artist" => json!([
+            act(
+                "radio",
+                t("Artist radio", "Radio de l'artiste"),
+                "radio",
+                "play"
+            ),
+            act(
+                "similar",
+                t("Similar artists", "Artistes similaires"),
+                "sim",
+                "browse"
+            )
+        ]),
+        _ => json!([]),
+    }
 }
 
 /// The audio stream of a media part (`streamType` 2), when the answer
@@ -104,6 +172,12 @@ pub fn track(s: &Session, v: &Value) -> Option<Value> {
     // album's (compilations, guests).
     let artist = text(v, "originalTitle").or_else(|| album_artist.clone());
     let album = text(v, "parentTitle");
+    // Listed by a playlist: the entry, for removing and moving it.
+    let entry = match &v["playlistItemID"] {
+        Value::Number(n) => Some(n.to_string()),
+        Value::String(s) if !s.is_empty() => Some(s.clone()),
+        _ => None,
+    };
     let it = json!({
         "ref": format!("t/{id}"),
         "kind": "track",
@@ -119,6 +193,11 @@ pub fn track(s: &Session, v: &Value) -> Option<Value> {
         "duration_ms": num(v, "duration"),
         "format": format(v),
         "playable": media(v).is_some(),
+        "album_ref": key_ref("a", v, "parentRatingKey"),
+        "artist_ref": key_ref("r", v, "grandparentRatingKey"),
+        "favorite": favorite(v),
+        "entry_id": entry,
+        "actions": actions("track", id, french()),
     });
     let thumb = text(v, "parentThumb")
         .or_else(|| text(v, "thumb"))
@@ -145,6 +224,9 @@ pub fn album(s: &Session, v: &Value) -> Option<Value> {
         "genre": genre(v),
         "track_count": num(v, "leafCount"),
         "browsable": true,
+        "artist_ref": key_ref("r", v, "parentRatingKey"),
+        "favorite": favorite(v),
+        "actions": actions("album", id, french()),
     });
     Some(finish(s, text(v, "thumb"), it))
 }
@@ -163,6 +245,8 @@ pub fn artist(s: &Session, v: &Value) -> Option<Value> {
         "artist": name,
         "genre": genre(v),
         "browsable": true,
+        "favorite": favorite(v),
+        "actions": actions("artist", id, french()),
     });
     Some(finish(s, text(v, "thumb"), it))
 }
@@ -179,9 +263,18 @@ pub fn playlist(s: &Session, v: &Value) -> Option<Value> {
         "subtitle": v["leafCount"].as_i64().map(|n| format!("{n} ♪")),
         "track_count": v["leafCount"].as_i64(),
         "browsable": true,
+        "editable": editable(v),
     });
     let thumb = text(v, "thumb").or_else(|| text(v, "composite"));
     Some(finish(s, thumb, it))
+}
+
+/// An audio playlist of the user's own making: smart ones follow their
+/// rules and cannot be edited by hand.
+pub fn editable(v: &Value) -> bool {
+    v["type"] == "playlist"
+        && v["playlistType"] == "audio"
+        && !(v["smart"] == true || v["smart"] == 1 || v["smart"] == "1")
 }
 
 /// Any music item, by its `type`.
@@ -197,6 +290,119 @@ pub fn any(s: &Session, v: &Value) -> Option<Value> {
 
 pub fn many(s: &Session, list: &[Value], f: fn(&Session, &Value) -> Option<Value>) -> Vec<Value> {
     list.iter().filter_map(|x| f(s, x)).collect()
+}
+
+/// Text without markup: tags dropped, common entities decoded, blank
+/// runs cut to one empty line.
+pub fn plain_text(s: &str) -> String {
+    let mut out = String::new();
+    let mut rest = s;
+    // Only `<` followed by a letter, `/` or `!` opens a tag: "a < b" stays.
+    while let Some(i) = rest.find('<') {
+        out.push_str(&rest[..i]);
+        let after = &rest[i + 1..];
+        let tag = after
+            .chars()
+            .next()
+            .is_some_and(|c| c.is_ascii_alphabetic() || c == '/' || c == '!');
+        match after.find('>').filter(|_| tag) {
+            Some(end) => {
+                let name = after[..end].trim_start_matches('/').to_ascii_lowercase();
+                if name.starts_with("br") || name.starts_with('p') {
+                    out.push('\n');
+                }
+                rest = &after[end + 1..];
+            }
+            None => {
+                out.push('<');
+                rest = after;
+            }
+        }
+    }
+    out.push_str(rest);
+    let out = out
+        .replace("&nbsp;", " ")
+        .replace("&quot;", "\"")
+        .replace("&#39;", "'")
+        .replace("&apos;", "'")
+        .replace("&lt;", "<")
+        .replace("&gt;", ">")
+        .replace("&amp;", "&")
+        .replace("\r\n", "\n");
+    let mut lines: Vec<&str> = Vec::new();
+    for l in out.lines().map(str::trim) {
+        if !(l.is_empty() && lines.last().is_none_or(|p| p.is_empty())) {
+            lines.push(l);
+        }
+    }
+    lines.join("\n").trim().to_string()
+}
+
+/// Tags of a kind (`Genre`, `Style`, `Mood`…) as one line.
+fn tags(v: &Value, k: &str) -> Option<String> {
+    let t: Vec<&str> = v[k]
+        .as_array()?
+        .iter()
+        .filter_map(|t| t["tag"].as_str())
+        .map(str::trim)
+        .filter(|t| !t.is_empty())
+        .collect();
+    (!t.is_empty()).then(|| t.join(", "))
+}
+
+/// Facts shown with an artist, album or track: label, release, tags.
+pub fn facts(v: &Value, fr: bool) -> Vec<Value> {
+    let t = |en: &'static str, f: &'static str| if fr { f } else { en };
+    let released = text(v, "originallyAvailableAt")
+        .or_else(|| num(v, "year").map(|y| y.to_string()))
+        .filter(|_| v["type"] != "artist");
+    let list = [
+        (t("Label", "Label"), text(v, "studio")),
+        (t("Released", "Sortie"), released),
+        (t("Genres", "Genres"), tags(v, "Genre")),
+        (t("Styles", "Styles"), tags(v, "Style")),
+        (t("Moods", "Ambiances"), tags(v, "Mood")),
+        (t("Country", "Pays"), tags(v, "Country")),
+    ];
+    list.into_iter()
+        .filter_map(|(label, value)| Some(json!({"label": label, "value": value?})))
+        .collect()
+}
+
+/// Shelves from the server's hubs about an item: the music items of each
+/// hub that has some, except hubs listed in `skip` (by `hubIdentifier`).
+pub fn shelves(s: &Session, hubs: &Value, skip: &[&str]) -> Vec<Value> {
+    hubs["Hub"]
+        .as_array()
+        .map(Vec::as_slice)
+        .unwrap_or_default()
+        .iter()
+        .filter(|h| !skip.iter().any(|k| h["hubIdentifier"] == *k))
+        .filter_map(|h| {
+            let title = text(h, "title")?;
+            let list = many(
+                s,
+                h["Metadata"]
+                    .as_array()
+                    .map(Vec::as_slice)
+                    .unwrap_or_default(),
+                any,
+            );
+            (!list.is_empty()).then(|| json!({"title": title, "items": list}))
+        })
+        .collect()
+}
+
+/// `playlists.move` asks for an index, Plex for the entry to follow.
+/// With `entries` the playlist in order: the entry that precedes `entry`
+/// once it sits at index `to` (clamped to the end); `Some(None)` for the
+/// top, `None` when `entry` is not in the playlist.
+pub fn move_after(entries: &[String], entry: &str, to: usize) -> Option<Option<String>> {
+    let from = entries.iter().position(|e| e == entry)?;
+    let mut rest: Vec<&String> = entries.iter().collect();
+    rest.remove(from);
+    let to = to.min(rest.len());
+    Some(to.checked_sub(1).map(|i| rest[i].clone()))
 }
 
 /// Track gain and peak from Plex's loudness analysis, when it ran.
@@ -329,6 +535,119 @@ mod tests {
         assert_eq!(split_ref("t/"), None);
         assert_eq!(split_ref("t/1/../x"), None);
         assert_eq!(split_ref("albums"), None);
+        assert_eq!(split_ref("sim/5"), Some(("sim", "5")));
+        assert_eq!(split_ref("radio/x"), None);
+    }
+
+    #[test]
+    fn links_and_state() {
+        let s = session();
+        // A track listed by a playlist, rated five stars.
+        let t = track(
+            &s,
+            &json!({"ratingKey": "3", "type": "track", "title": "Coda",
+                    "parentRatingKey": "2", "grandparentRatingKey": "1",
+                    "userRating": 10.0, "playlistItemID": 41}),
+        )
+        .unwrap();
+        assert_eq!(t["album_ref"], "a/2");
+        assert_eq!(t["artist_ref"], "r/1");
+        assert_eq!(t["favorite"], true);
+        assert_eq!(t["entry_id"], "41");
+        assert_eq!(
+            t["actions"],
+            json!([{"id": "sonic", "label": "Sonically similar tracks",
+                    "ref": "sonic/3", "kind": "play"}])
+        );
+        let t = track(
+            &s,
+            &json!({"ratingKey": "4", "type": "track", "userRating": 6.0,
+                    "parentRatingKey": "../x"}),
+        )
+        .unwrap();
+        assert_eq!(t["favorite"], false);
+        assert!(t.get("album_ref").is_none() && t.get("entry_id").is_none());
+        let a = album(
+            &s,
+            &json!({"ratingKey": "2", "type": "album", "parentRatingKey": "1"}),
+        )
+        .unwrap();
+        assert_eq!(a["artist_ref"], "r/1");
+        assert_eq!(a["favorite"], false);
+        assert_eq!(a["actions"][0]["ref"], "sim/2");
+        assert_eq!(a["actions"][0]["kind"], "browse");
+        let fr = actions("artist", "1", true);
+        assert_eq!(fr[0]["label"], "Radio de l'artiste");
+        assert_eq!(fr[0]["ref"], "radio/1");
+        assert_eq!(fr[1]["label"], "Artistes similaires");
+        let pl = |smart: Value| {
+            playlist(
+                &s,
+                &json!({"ratingKey": "12", "type": "playlist", "playlistType": "audio",
+                        "smart": smart}),
+            )
+            .unwrap()
+        };
+        assert_eq!(pl(json!(false))["editable"], true);
+        assert_eq!(pl(json!(true))["editable"], false);
+        assert_eq!(pl(json!("1"))["editable"], false);
+        assert!(pl(json!(false)).get("favorite").is_none());
+    }
+
+    #[test]
+    fn details_text() {
+        assert_eq!(
+            plain_text("  First &amp; <i>best</i>.<br/>Next line<p>New\r\n\r\n\r\npara</p> 1 < 2 "),
+            "First & best.\nNext line\nNew\n\npara\n1 < 2"
+        );
+        let v = json!({"type": "album", "studio": "Blue Label",
+                       "originallyAvailableAt": "2021-03-05", "year": 2021,
+                       "Genre": [{"tag": "Jazz"}, {"tag": "Soul"}], "Mood": [{"tag": " "}]});
+        assert_eq!(
+            facts(&v, false),
+            [
+                json!({"label": "Label", "value": "Blue Label"}),
+                json!({"label": "Released", "value": "2021-03-05"}),
+                json!({"label": "Genres", "value": "Jazz, Soul"})
+            ]
+        );
+        let v = json!({"type": "artist", "year": 1999, "Country": [{"tag": "France"}]});
+        assert_eq!(
+            facts(&v, true),
+            [json!({"label": "Pays", "value": "France"})]
+        );
+    }
+
+    #[test]
+    fn hub_shelves() {
+        let hubs = json!({"Hub": [
+            {"hubIdentifier": "artist.mostpopulartracks", "title": "Most Popular Tracks",
+             "Metadata": [{"ratingKey": "3", "type": "track", "title": "Coda"},
+                          {"ratingKey": "9", "type": "clip", "title": "Video"}]},
+            {"hubIdentifier": "artist.albums", "title": "Albums",
+             "Metadata": [{"ratingKey": "2", "type": "album"}]},
+            {"hubIdentifier": "artist.mostplayedtracks", "title": "Most Played", "size": 0},
+            {"hubIdentifier": "music.videos", "title": "Videos",
+             "Metadata": [{"ratingKey": "9", "type": "clip"}]}
+        ]});
+        let sh = shelves(&session(), &hubs, &["artist.albums"]);
+        assert_eq!(sh.len(), 1);
+        assert_eq!(sh[0]["title"], "Most Popular Tracks");
+        assert_eq!(sh[0]["items"].as_array().unwrap().len(), 1);
+        assert_eq!(sh[0]["items"][0]["ref"], "t/3");
+    }
+
+    #[test]
+    fn move_index_to_after() {
+        let e: Vec<String> = ["1", "2", "3", "4"].map(String::from).to_vec();
+        let after = |entry: &str, to| move_after(&e, entry, to);
+        assert_eq!(after("3", 0), Some(None));
+        assert_eq!(after("1", 1), Some(Some("2".into())));
+        assert_eq!(after("1", 3), Some(Some("4".into())));
+        assert_eq!(after("1", 99), Some(Some("4".into())));
+        assert_eq!(after("4", 1), Some(Some("1".into())));
+        assert_eq!(after("2", 1), Some(Some("1".into())));
+        assert_eq!(after("9", 0), None);
     }
 
     #[test]

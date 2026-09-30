@@ -1,9 +1,10 @@
 #!/bin/sh
 # Start a throwaway Plex Media Server on 127.0.0.1:32400 with generated FLAC
 # files: a "Music" library (three 44.1 kHz / 16-bit tracks, two 192 kHz /
-# 24-bit ones, one 176.4 kHz / 24-bit) and, added after it, a "Classical"
-# library with one more album. Then run the end-to-end test against it. The
-# server stays unclaimed and lets the test network in without a token.
+# 24-bit ones, one 176.4 kHz / 24-bit; lyrics for two tracks) and, added
+# after it, a "Classical" library with one more album. Then run the
+# end-to-end test against it. The server stays unclaimed and lets the test
+# network in without a token.
 #   tests/plex.sh [workdir]      (needs docker, ffmpeg, python3)
 set -eu
 W=${1:-$(mktemp -d)}
@@ -33,6 +34,10 @@ ffmpeg -loglevel error -y -f lavfi -i "sine=frequency=880:duration=10" $C \
   -ar 44100 -sample_fmt s16 -metadata title=Aria -metadata artist=Soloist \
   -metadata album_artist=Soloist -metadata album=Solo -metadata date=2019 \
   -metadata track=1 "$W/classical/Soloist/Solo/01.flac"
+# Lyrics next to two tracks: timed (LRC) and plain.
+printf '[ar:Ensemble]\n[ti:Track 1]\n[00:01.00]First line\n[00:05.50][00:12.00]Twice\n[00:09.25]Third line\n' \
+  > "$W/music/Ensemble/Sessions/01.lrc"
+printf 'Plain words\nSecond plain line\n' > "$W/music/Ensemble/Sessions/02.txt"
 docker rm -f ricercar-plex-test >/dev/null 2>&1 || true
 docker run -d --name ricercar-plex-test -p 127.0.0.1:32400:32400 \
   -e ALLOWED_NETWORKS=0.0.0.0/0 -e TZ=UTC \

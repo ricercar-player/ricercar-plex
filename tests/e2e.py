@@ -3,7 +3,7 @@
 plex.sh): JSON-RPC over stdio, the streams with ffprobe. The server is
 unclaimed and open to the test network, so any token passes; the plex.tv
 sign-in (PIN) cannot be tested here beyond creating the PIN."""
-import json, subprocess, sys, threading, queue, urllib.request, time, os, stat
+import json, subprocess, sys, threading, queue, urllib.request, urllib.parse, time, os, stat
 S = sys.argv[1]
 BIN = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "target", "release", "ricercar-plex")
 PMS = "http://127.0.0.1:32400"
@@ -48,6 +48,9 @@ for f in ("auth.json",):
 p = P()
 init = p.call("initialize", {"protocol": 1, "data_dir": DATA, "locale": "fr-FR", "output": OUT})
 check(init["capabilities"]["library"] and init["plugin"]["id"] == "plex", "initialize")
+check(all(init["capabilities"][k] for k in ("lyrics", "playlist_edit", "details", "radio")), "new capabilities")
+check([(x["key"], x["default"]) for x in init["settings"]] == [("report_playback", True), ("transcode", "auto")]
+      and init["settings"][0]["label"] == "Signaler mes écoutes", "settings declared, in French")
 cid = open(DATA + "/client_id").read()
 check(cid.startswith("ricercar-"), "client id kept: " + cid)
 check(p.call("auth.status")["state"] == "signed_out", "signed out at first")
@@ -97,6 +100,33 @@ t1 = tr["items"][0]; it = p.call("item.get", {"ref": t1["ref"]})
 check(it["title"] == "Track 1" and it["format"] == {"sample_rate": 44100, "bits": 16, "channels": 1, "codec": "flac"}, "item.get track, with format")
 check(p.call("item.get", {"ref": "t/999999"}).get("code") == -32002, "item.get missing -> not_found")
 check(p.call("item.get", {"ref": "t/../x"}).get("code") == -32002, "bad ref -> not_found")
+# links, actions, lyrics, details, radio
+check(p.call("browse.list", {"ref": t1["album_ref"], "offset": 0, "limit": 10})["items"][0]["ref"] == t1["ref"], "track album_ref browses")
+check(p.call("item.get", {"ref": t1["artist_ref"]})["title"] == "Ensemble" and sess["artist_ref"] == t1["artist_ref"], "artist_ref of track and album")
+check(t1["favorite"] is False and [a["id"] for a in t1["actions"]] == ["sonic"] and t1["actions"][0]["label"] == "Titres au son proche", "track actions, in French")
+ens = [x for x in ar["items"] if x["title"] == "Ensemble"][0]
+check([(a["id"], a["kind"]) for a in ens["actions"]] == [("radio", "play"), ("similar", "browse")], "artist actions")
+for a in t1["actions"] + sess["actions"] + ens["actions"]:
+    r = p.call("browse.list", {"ref": a["ref"], "offset": 0, "limit": 50})
+    check("items" in r, "action %s browses: %d items" % (a["ref"], len(r.get("items", []))))
+rad = p.call("browse.list", {"ref": ens["actions"][0]["ref"], "offset": 0, "limit": 50})["items"]
+check(sorted(x["title"] for x in rad) == ["Track 1", "Track 2", "Track 3"], "artist radio: its tracks (no similar artists here)")
+ly = p.call("lyrics.get", {"ref": t1["ref"]})
+check([(l["time_ms"], l["text"]) for l in ly.get("synced", [])] == [(1000, "First line"), (5500, "Twice"), (9250, "Third line"), (12000, "Twice")], "synced lyrics " + json.dumps(ly))
+ly = p.call("lyrics.get", {"ref": tr["items"][1]["ref"]})
+check(ly == {"plain": "Plain words\nSecond plain line"}, "plain lyrics " + json.dumps(ly))
+check(p.call("lyrics.get", {"ref": tr["items"][2]["ref"]}).get("code") == -32002, "no lyrics -> not_found")
+check(p.call("lyrics.get", {"ref": sess["ref"]}).get("code") == -32002, "lyrics of an album -> not_found")
+d = p.call("item.details", {"ref": ens["ref"]})
+check([x["title"] for x in d.get("related", [])] == ["Most Popular Tracks"] and len(d["related"][0]["items"]) == 3, "artist details: shelves " + json.dumps(d)[:300])
+d = p.call("item.details", {"ref": sess["ref"]})
+check(any(f["label"] == "Sortie" and f["value"].startswith("2021") for f in d.get("facts", [])), "album details: facts " + json.dumps(d.get("facts"), ensure_ascii=False))
+check(p.call("item.details", {"ref": "t/999999"}).get("code") == -32002, "details of a missing item -> not_found")
+rn = p.call("radio.next", {"seed": t1["ref"], "exclude": [tr["items"][1]["ref"]], "limit": 5})
+check([x["ref"] for x in rn["items"]] == [tr["items"][2]["ref"]], "radio.next: artist tracks, seed and exclude left out")
+rn = p.call("radio.next", {"seed": sess["ref"], "exclude": [], "limit": 2})
+check(len(rn["items"]) == 2 and all(x["playable"] for x in rn["items"]), "radio.next from an album, limited")
+check(p.call("radio.next", {"seed": "nope", "exclude": [], "limit": 2}).get("code") == -32602, "radio.next bad seed")
 # playlists (made through the API, as a Plex app would)
 mid = pms("/identity")["machineIdentifier"]; pl_ids = ",".join(x["ref"][2:] for x in tr["items"][:2])
 urllib.request.urlopen(urllib.request.Request(f"{PMS}/playlists?type=audio&title=Road%20Mix&smart=0&uri=server://{mid}/com.plexapp.plugins.library/library/metadata/{pl_ids}", method="POST"))
@@ -106,6 +136,7 @@ lp = p.call("library.playlists", {"offset": 0, "limit": 200})
 check([(x["ref"], x["kind"], x["browsable"]) for x in lp["items"]] == [(mix[0]["ref"], "playlist", True)] and lp["total"] == 1 and not lp["has_more"], "library.playlists")
 check(len(p.call("browse.list", {"ref": mix[0]["ref"], "offset": 0, "limit": 50})["items"]) == 2, "playlist tracks")
 check(p.call("item.get", {"ref": mix[0]["ref"]})["kind"] == "playlist", "item.get playlist")
+check(mix[0]["editable"] is True, "a playlist of one's own is editable")
 check([x["title"] for x in p.call("search", {"query": "road", "kinds": ["playlist"], "offset": 0, "limit": 5})["groups"][0]["items"]] == ["Road Mix"], "search playlists")
 sr = p.call("search", {"query": "Mix", "offset": 0, "limit": 5}); g = {x["kind"]: [i["title"] for i in x["items"]] for x in sr["groups"]}
 check(g["playlist"] == ["Road Mix"] and g["artist"] == [], "search, all groups: playlist found")
@@ -115,6 +146,30 @@ check(p.call("favorites.set", {"ref": sess["ref"], "on": True}) is None, "rate a
 fav = p.call("browse.list", {"ref": "favorites", "offset": 0, "limit": 50}); check(sorted(x["kind"] for x in fav["items"]) == ["album", "track"], "favorites list")
 p.call("favorites.set", {"ref": sess["ref"], "on": False}); check(len(p.call("browse.list", {"ref": "favorites", "offset": 0, "limit": 50})["items"]) == 1, "unrate album")
 check(p.call("favorites.set", {"ref": mix[0]["ref"], "on": True}).get("code") == -32003, "playlist cannot be rated")
+check(p.call("item.get", {"ref": t1["ref"]})["favorite"] is True and p.call("item.get", {"ref": sess["ref"]})["favorite"] is False, "favorite flags")
+# playlist editing
+new = p.call("playlists.create", {"name": "Fresh", "description": "Made <b>here</b>", "public": True})
+check(new.get("kind") == "playlist" and new["title"] == "Fresh" and new["editable"] and new.get("track_count") == 0, "playlists.create " + json.dumps(new)[:200])
+tref = [x["ref"] for x in tr["items"]]
+check(p.call("playlists.add", {"ref": new["ref"], "items": tref}) is None, "playlists.add")
+check(p.call("playlists.add", {"ref": new["ref"], "items": ["p/1"]}).get("code") == -32602, "playlists.add of a playlist refused")
+ent = lambda: [(x["ref"], x["entry_id"]) for x in p.call("browse.list", {"ref": new["ref"], "offset": 0, "limit": 50})["items"]]
+e = ent(); check([x[0] for x in e] == tref and all(x[1] for x in e), "entries " + str(e))
+check(p.call("playlists.move", {"ref": new["ref"], "entry": e[2][1], "to": 0}) is None, "move last to first")
+check([x[0] for x in ent()] == [tref[2], tref[0], tref[1]], "moved to the top")
+check(p.call("playlists.move", {"ref": new["ref"], "entry": e[2][1], "to": 2}) is None, "move first to the end")
+check([x[0] for x in ent()] == tref, "moved to the end")
+check(p.call("playlists.move", {"ref": new["ref"], "entry": e[0][1], "to": 1}) is None, "move first to second")
+check([x[0] for x in ent()] == [tref[1], tref[0], tref[2]], "moved one down")
+check(p.call("playlists.move", {"ref": new["ref"], "entry": "999999", "to": 1}).get("code") == -32002, "move of a missing entry")
+check(p.call("playlists.remove", {"ref": new["ref"], "entries": [e[0][1], e[2][1]]}) is None, "playlists.remove")
+check([x[0] for x in ent()] == [tref[1]], "removed two entries")
+check(p.call("playlists.rename", {"ref": new["ref"], "name": "Renamed"}) is None and p.call("item.get", {"ref": new["ref"]})["title"] == "Renamed", "playlists.rename")
+check(pms("/playlists/" + new["ref"][2:])["Metadata"][0]["summary"] == "Made <b>here</b>", "description kept")
+urllib.request.urlopen(urllib.request.Request(f"{PMS}/playlists?type=audio&title=Smart&smart=1&uri=" + urllib.parse.quote(f"server://{mid}/com.plexapp.plugins.library/library/sections/1/all?type=10&title=Track", safe=""), method="POST"))
+smart = [x for x in p.call("library.playlists", {"offset": 0, "limit": 200})["items"] if x["title"] == "Smart"][0]
+check(smart["editable"] is False and p.call("playlists.rename", {"ref": smart["ref"], "name": "x"}).get("code") == -32602, "smart playlist not editable")
+check(p.call("playlists.delete", {"ref": new["ref"]}) is None and p.call("item.get", {"ref": new["ref"]}).get("code") == -32002, "playlists.delete")
 # direct resolve
 r = p.call("track.resolve", {"ref": t1["ref"], "purpose": "play"})
 check("/library/parts/" in r["url"] and r["duration_ms"] == 20000 and r["format"]["sample_rate"] == 44100, "resolve direct")
@@ -136,7 +191,11 @@ check(r["format"]["sample_rate"] == 48000 and got == "48000,24", "48k DAC: 192k 
 p.notify("output.changed", {"output": {"bit_perfect": True, "max_rate": 44100, "max_bits": 16, "rates": [44100]}}); time.sleep(0.2)
 r = p.call("track.resolve", {"ref": hi["ref"], "purpose": "play"}); check(r.get("code") == -32003, "CD DAC, 24-bit file -> unavailable: " + r.get("message", ""))
 r = p.call("track.resolve", {"ref": t1["ref"], "purpose": "play"}); check("/library/parts/" in r.get("url", ""), "CD DAC, CD file -> direct")
-p.notify("output.changed", {"output": OUT})
+p.notify("settings.changed", {"settings": {"report_playback": True, "transcode": "never"}}); time.sleep(0.2)
+p.notify("output.changed", {"output": OUT}); time.sleep(0.2)
+r = p.call("track.resolve", {"ref": hi["ref"], "purpose": "play"})
+check("/library/parts/" in r.get("url", "") and r["format"]["sample_rate"] == 192000, "transcode never: original file")
+p.notify("settings.changed", {"settings": {"report_playback": True, "transcode": "auto"}}); time.sleep(0.2)
 # reporting
 t2 = tr["items"][1]; t3 = tr["items"][2]
 vc = lambda ref: pms("/library/metadata/" + ref[2:])["Metadata"][0].get("viewCount", 0)
@@ -150,6 +209,11 @@ b2 = vc(t2["ref"])
 p.notify("playback.started", {"ref": t2["ref"]}); time.sleep(0.5)
 p.notify("playback.ended", {"ref": t2["ref"], "listened_ms": 3000, "reason": "skipped"}); time.sleep(1)
 check(vc(t2["ref"]) == b2, "short skip not counted")
+p.notify("settings.changed", {"settings": {"report_playback": False, "transcode": "auto"}}); time.sleep(0.2)
+p.notify("playback.started", {"ref": t2["ref"]}); time.sleep(0.5)
+p.notify("playback.ended", {"ref": t2["ref"], "listened_ms": 20000, "reason": "ended"}); time.sleep(1)
+check(vc(t2["ref"]) == b2, "report_playback off: nothing sent")
+p.notify("settings.changed", {"settings": {"report_playback": True, "transcode": "auto"}})
 fr = p.call("browse.list", {"ref": "frequent", "offset": 0, "limit": 10}); check(t3["ref"] in [x["ref"] for x in fr["items"]], "most played")
 for shelf in ("played", "top"):
     sh = p.call("browse.list", {"ref": shelf, "offset": 0, "limit": 10})

@@ -18,13 +18,32 @@ music of your own [Plex Media Server](https://www.plex.tv).
   plugin ask the server for FLAC at the closest rate the DAC accepts (same
   44.1/48 kHz family, never higher than the original). Plex keeps the bit
   depth of the file when it transcodes, so a 24-bit file on a 16-bit-only
-  DAC is reported as unavailable on that output.
-- **Favourites** are five-star ratings, shared with the other Plex apps.
+  DAC is reported as unavailable on that output. A setting sends the
+  original file instead.
+- **Favourites** are five-star ratings, shared with the other Plex apps;
+  ricercar shows which items are rated.
 - **Plays** show on the server while they last (its "now playing") and
   count in its play history and "most played" once a track is heard to the
-  end, or half of it, or four minutes.
+  end, or half of it, or four minutes. A setting turns this off.
+- **Lyrics** the server has for a track (`.lrc` or `.txt` files next to it,
+  embedded tags, or its online provider), synced when they are timed.
+- **Go to** a track's album or artist; **similar** artists and albums,
+  **sonically similar** tracks and an **artist radio** from an item's menu.
+- **Details** on artist and album pages: the server's summary, its shelves
+  (popular tracks, similar items…), label, release date, genres, styles
+  and moods.
+- **Continuous playback:** when the queue ends, tracks that sound like the
+  last one, or of its artist and similar artists.
+- **Playlists:** create, rename and delete your audio playlists, add and
+  remove tracks, reorder them. Smart playlists are read-only.
 - **Loudness:** when the server has analysed loudness, the track gain and
   peak are passed to ricercar.
+
+Similar items and sonically similar tracks depend on what the server
+knows: its online metadata agents, and sonic analysis (Plex Pass). Without
+them those lists are empty. Lyrics, details, the radio, playlist editing
+and settings need a ricercar version that supports them; older ones ignore
+them.
 
 The plugin uses the documented
 [Plex Media Server API](https://developer.plex.tv/pms/) and plex.tv's
@@ -91,7 +110,9 @@ Signing in from another computer than the one running ricercar: paste
 Plugin protocol 1, as described in ricercar's
 [docs/plugins.md](https://github.com/ricercar-player/ricercar/blob/main/docs/plugins.md),
 with the `library` capability (`library.albums`, `library.artists`,
-`library.tracks`, `library.playlists`) and `home` shelves.
+`library.tracks`, `library.playlists`), `home` shelves, settings
+(`report_playback`, `transcode`), and the `lyrics`, `details`, `radio` and
+`playlist_edit` capabilities (`playlists.move` included).
 
 | Ref | Meaning |
 |---|---|
@@ -101,6 +122,9 @@ with the `library` capability (`library.albums`, `library.artists`,
 | `a/<ratingKey>` | Album |
 | `r/<ratingKey>` | Artist (its albums) |
 | `p/<ratingKey>` | Playlist |
+| `sim/<ratingKey>` | Artists or albums similar to an artist or album |
+| `sonic/<ratingKey>` | Tracks that sound like a track |
+| `radio/<ratingKey>` | Radio from a track, album or artist |
 
 Error codes follow the protocol: a refused token marks the session expired
 (`auth_required`) and sends `auth.changed`; missing items answer

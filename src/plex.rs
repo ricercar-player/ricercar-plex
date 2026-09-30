@@ -227,6 +227,23 @@ impl Client {
         query: &[(&str, String)],
         page: Option<(u64, u64)>,
     ) -> Result<Value> {
+        let text = self.fetch(agent, method, url, token, query, page)?;
+        if text.trim().is_empty() {
+            return Ok(Value::Null);
+        }
+        serde_json::from_str(&text).map_err(|_| Error::Network("not a Plex server".into()))
+    }
+
+    /// The body of an answer, as text.
+    fn fetch(
+        &self,
+        agent: &ureq::Agent,
+        method: &str,
+        url: &str,
+        token: Option<&str>,
+        query: &[(&str, String)],
+        page: Option<(u64, u64)>,
+    ) -> Result<String> {
         let mut req = self.headers(agent.request(method, url), token);
         for (k, v) in query {
             req = req.query(k, v);
@@ -237,13 +254,7 @@ impl Client {
                 .set("X-Plex-Container-Size", &size.to_string());
         }
         match req.call() {
-            Ok(r) => {
-                let text = r.into_string().map_err(|e| Error::Network(e.to_string()))?;
-                if text.trim().is_empty() {
-                    return Ok(Value::Null);
-                }
-                serde_json::from_str(&text).map_err(|_| Error::Network("not a Plex server".into()))
-            }
+            Ok(r) => r.into_string().map_err(|e| Error::Network(e.to_string())),
             Err(ureq::Error::Status(401, _)) => Err(Error::Auth),
             Err(ureq::Error::Status(404, _)) => Err(Error::NotFound),
             Err(ureq::Error::Status(code, r)) => {
@@ -298,9 +309,28 @@ impl Client {
         path: &str,
         query: &[(&str, String)],
     ) -> Result<()> {
+        self.request(s, method, path, query).map(|_| ())
+    }
+
+    /// Any method without a body: the `MediaContainer` of the answer
+    /// (`Null` when the server sends nothing back).
+    pub fn request(
+        &self,
+        s: &Session,
+        method: &str,
+        path: &str,
+        query: &[(&str, String)],
+    ) -> Result<Value> {
         let url = format!("{}{path}", s.server);
-        self.send(&self.agent, method, &url, Some(&s.token), query, None)
-            .map(|_| ())
+        let v = self.send(&self.agent, method, &url, Some(&s.token), query, None)?;
+        Ok(v["MediaContainer"].clone())
+    }
+
+    /// `GET <path>` as text: a lyrics file, as stored next to the music or
+    /// as the server's JSON.
+    pub fn text(&self, s: &Session, path: &str) -> Result<String> {
+        let url = format!("{}{path}", s.server);
+        self.fetch(&self.agent, "GET", &url, Some(&s.token), &[], None)
     }
 
     /// `/identity` of a candidate address: its machine identifier, when it

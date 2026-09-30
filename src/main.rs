@@ -4,7 +4,8 @@
 //! Plex Media Server API with the user's server. Sign-in goes through
 //! plex.tv's PIN flow in the browser. Tracks play from the original file,
 //! bit for bit, unless the DAC cannot take its sample rate; then the server
-//! sends FLAC at a rate it does take.
+//! sends FLAC at a rate it does take. Also: lyrics, playlist editing,
+//! details and similar items, and a radio, from what the server knows.
 //!
 //! Options:
 //!   --server NAME|URL   the server to use when the account has several, or
@@ -12,9 +13,10 @@
 //!                       plex.tv knows)
 
 mod items;
+mod lyrics;
 mod plex;
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::io::{BufRead, BufReader, Read, Write};
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
@@ -33,6 +35,10 @@ const FAVORITES_MAX: u64 = 1000;
 const PIN_POLL: Duration = Duration::from_secs(2);
 /// Strong PINs live 30 minutes.
 const PIN_LIFE: Duration = Duration::from_secs(30 * 60);
+/// Tracks of a radio action, and most asked for by `radio.next`.
+const RADIO_MAX: usize = 50;
+/// Entries of a playlist read to move one of them.
+const PLAYLIST_MAX: u64 = 20_000;
 
 /// `<n>` random bytes from the kernel, as hex.
 pub fn random_hex(n: usize) -> String {
@@ -71,6 +77,53 @@ impl Out {
     }
 }
 
+/// The plugin's settings, from `initialize` and `settings.changed`;
+/// missing or unexpected values keep their default.
+#[derive(Clone, Debug, PartialEq)]
+struct Settings {
+    /// Send timelines and scrobbles to the server.
+    report: bool,
+    /// Ask the server for FLAC at a rate the DAC takes when it cannot take
+    /// the file's; `false`: always the original file.
+    transcode: bool,
+}
+
+impl Settings {
+    fn from_json(v: &Value) -> Settings {
+        Settings {
+            report: v["report_playback"].as_bool().unwrap_or(true),
+            transcode: v["transcode"].as_str() != Some("never"),
+        }
+    }
+
+    /// The declaration sent with `initialize`.
+    fn declare(fr: bool) -> Value {
+        let t = |en: &'static str, f: &'static str| if fr { f } else { en };
+        let section = t("Playback", "Lecture");
+        json!([
+            {"key": "report_playback", "type": "bool", "section": section,
+             "label": t("Report what I play", "Signaler mes écoutes"),
+             "description": t(
+                "Show the track on the server while it plays (its “now playing” and resume point), and count it in its play history once heard.",
+                "Afficher la piste sur le serveur pendant la lecture (« en cours » et point de reprise), et la compter dans son historique une fois écoutée."),
+             "default": true},
+            {"key": "transcode", "type": "choice", "section": section,
+             "label": t("When the DAC cannot take a file's sample rate",
+                        "Quand le DAC n'accepte pas la fréquence d'un fichier"),
+             "description": t(
+                "The server can convert the file to FLAC at the closest rate the DAC takes, keeping its bit depth. With the original file, nothing is converted, and a bit-perfect output cannot play such tracks.",
+                "Le serveur peut convertir le fichier en FLAC à la fréquence la plus proche acceptée par le DAC, sans changer sa résolution. Avec le fichier d'origine, rien n'est converti, et une sortie bit-perfect ne peut pas lire ces pistes."),
+             "options": [
+                {"value": "auto", "label": t("Ask the server for FLAC at a rate it takes",
+                                             "Demander au serveur du FLAC à une fréquence acceptée")},
+                {"value": "never", "label": t("Always send the original file",
+                                              "Toujours envoyer le fichier d'origine")}
+             ],
+             "default": "auto"}
+        ])
+    }
+}
+
 /// A track being played, for the timeline and the scrobble.
 struct Playing {
     duration_ms: u64,
@@ -82,7 +135,7 @@ struct Plugin {
     /// `--server`: a server name, or an address.
     server_hint: String,
     data_dir: Mutex<PathBuf>,
-    french: Mutex<bool>,
+    settings: Mutex<Settings>,
     output: Mutex<Output>,
     client: Arc<Client>,
     session: Mutex<Option<Session>>,
@@ -106,7 +159,15 @@ impl Plugin {
     }
 
     fn fr(&self) -> bool {
-        *self.french.lock().unwrap()
+        items::french()
+    }
+
+    fn apply_settings(&self, v: &Value) {
+        let new = Settings::from_json(v);
+        if !new.report {
+            self.playing.lock().unwrap().clear();
+        }
+        *self.settings.lock().unwrap() = new;
     }
 
     fn auth_path(&self) -> PathBuf {
@@ -209,6 +270,15 @@ impl Plugin {
         self.with(|s| Ok((s.clone(), self.client.get(s, path, q)?)))
     }
 
+    /// Like `get`, for lists a server may lack (older versions, features
+    /// of Plex Pass): "not found" and "forbidden" are an empty answer.
+    fn get_optional(&self, path: &str, q: &[(&str, String)]) -> Result<(Session, Value), RpcError> {
+        self.with(|s| match self.client.get(s, path, q) {
+            Err(Error::NotFound | Error::Status(403, _)) => Ok((s.clone(), Value::Null)),
+            r => Ok((s.clone(), r?)),
+        })
+    }
+
     fn page(
         &self,
         path: &str,
@@ -227,8 +297,9 @@ impl Plugin {
             .map(PathBuf::from)
             .unwrap_or_else(std::env::temp_dir);
         let _ = std::fs::create_dir_all(&data_dir);
-        *self.french.lock().unwrap() = p["locale"].as_str().is_some_and(|l| l.starts_with("fr"));
+        items::set_french(p["locale"].as_str().is_some_and(|l| l.starts_with("fr")));
         *self.output.lock().unwrap() = Output::from_json(&p["output"]);
+        self.apply_settings(&p["settings"]);
         // Plex lists each client identifier among the account's devices:
         // keep one per installation.
         let id_path = data_dir.join("client_id");
@@ -258,8 +329,10 @@ impl Plugin {
             "capabilities": {
                 "auth": true, "browse": true, "search": true, "resolve": true,
                 "favorites": true, "reporting": true, "remote_control": false,
-                "library": true
-            }
+                "library": true, "lyrics": true, "playlist_edit": true,
+                "details": true, "radio": true
+            },
+            "settings": Settings::declare(self.fr())
         }))
     }
 
@@ -608,6 +681,9 @@ impl Plugin {
                 limit,
                 items::track,
             ),
+            "sim" => Ok(page(self.similar(id)?, offset, limit)),
+            "sonic" => Ok(page(self.sonic(id, RADIO_MAX)?, offset, limit)),
+            "radio" => Ok(page(self.radio(id, &[], RADIO_MAX)?, offset, limit)),
             _ => Err(rpc_err(-32002, "no such list")),
         }
     }
@@ -667,6 +743,7 @@ impl Plugin {
 
     fn item_get(&self, p: &Value) -> Reply {
         let (kind, id) = items::split_ref(p["ref"].as_str().unwrap_or(""))
+            .filter(|(k, _)| matches!(*k, "t" | "a" | "r" | "p"))
             .ok_or_else(|| rpc_err(-32002, "no such item"))?;
         let path = if kind == "p" {
             format!("/playlists/{id}")
@@ -682,6 +759,7 @@ impl Plugin {
 
     fn favorite(&self, p: &Value) -> Reply {
         let (kind, id) = items::split_ref(p["ref"].as_str().unwrap_or(""))
+            .filter(|(k, _)| matches!(*k, "t" | "a" | "r" | "p"))
             .ok_or_else(|| rpc_err(-32002, "no such item"))?;
         if kind == "p" {
             return Err(rpc_err(-32003, "playlists cannot be rated"));
@@ -732,7 +810,10 @@ impl Plugin {
             Some(b) => format!("{} Hz / {b} bits", rate.unwrap_or(0)),
             None => format!("{} Hz", rate.unwrap_or(0)),
         };
-        let plan = items::plan(&self.output.lock().unwrap(), rate, bits);
+        let plan = match items::plan(&self.output.lock().unwrap(), rate, bits) {
+            Plan::Flac { .. } if !self.settings.lock().unwrap().transcode => Plan::Direct,
+            plan => plan,
+        };
         let (url, format) = match plan {
             Plan::Direct => {
                 let key = media["Part"][0]["key"].as_str().unwrap_or("");
@@ -834,12 +915,360 @@ impl Plugin {
         Ok(url)
     }
 
+    // --------------------------------------------------------------- lyrics
+
+    /// The first lyric stream of the track with words in it: sidecar
+    /// `.lrc` / `.txt` files, embedded tags, or the server's provider.
+    fn lyrics(&self, p: &Value) -> Reply {
+        let Some(("t", id)) = items::split_ref(p["ref"].as_str().unwrap_or("")) else {
+            return Err(rpc_err(-32002, "not a track"));
+        };
+        let (_, v) = self.get(&format!("/library/metadata/{id}"), &[])?;
+        for st in lyrics::streams(&v["Metadata"][0]) {
+            let key = st["key"].as_str().unwrap_or("");
+            match self.with(|s| self.client.text(s, key)) {
+                Ok(body) => {
+                    if let Some(l) = lyrics::answer(&body) {
+                        return Ok(l);
+                    }
+                }
+                Err(e) => eprintln!("lyrics of t/{id}: {}", e.message),
+            }
+        }
+        Err(rpc_err(-32002, "no lyrics for this track"))
+    }
+
+    // -------------------------------------------------------------- details
+
+    /// Artists or albums like `id`, as raw metadata: the server's similar
+    /// items, else those of its related hubs (albums have no `similar`
+    /// list).
+    fn similar_raw(&self, id: &str) -> Result<(Session, Vec<Value>), RpcError> {
+        let (s, v) = self.get_optional(&format!("/library/metadata/{id}/similar"), &[])?;
+        let list = v["Metadata"].as_array().cloned().unwrap_or_default();
+        if !list.is_empty() {
+            return Ok((s, list));
+        }
+        let q = [("count", "20".to_string())];
+        let (s, hubs) = self.get_optional(&format!("/hubs/metadata/{id}/related"), &q)?;
+        let mut seen = HashSet::new();
+        let list = hubs["Hub"]
+            .as_array()
+            .map(Vec::as_slice)
+            .unwrap_or_default()
+            .iter()
+            .flat_map(|h| {
+                h["Metadata"]
+                    .as_array()
+                    .map(Vec::as_slice)
+                    .unwrap_or_default()
+            })
+            .filter(|m| m["type"] == "album" || m["type"] == "artist")
+            .filter(|m| seen.insert(m["ratingKey"].to_string()))
+            .cloned()
+            .collect();
+        Ok((s, list))
+    }
+
+    fn similar(&self, id: &str) -> Result<Vec<Value>, RpcError> {
+        let (s, mut list) = self.similar_raw(id)?;
+        self.artist_art(&s, &mut list);
+        Ok(items::many(&s, &list, items::any))
+    }
+
+    /// Tracks that sound like track `id` (sonic analysis: Plex Pass, and
+    /// a server that ran it); none otherwise.
+    fn sonic(&self, id: &str, limit: usize) -> Result<Vec<Value>, RpcError> {
+        let q = [("limit", limit.to_string())];
+        let (s, v) = self.get_optional(&format!("/library/metadata/{id}/nearest"), &q)?;
+        let list = v["Metadata"]
+            .as_array()
+            .map(Vec::as_slice)
+            .unwrap_or_default();
+        Ok(items::many(&s, list, items::track))
+    }
+
+    /// Biography (the server's summary), shelves from its hubs, and facts.
+    fn details(&self, p: &Value) -> Reply {
+        let (kind, id) = items::split_ref(p["ref"].as_str().unwrap_or(""))
+            .filter(|(k, _)| matches!(*k, "t" | "a" | "r" | "p"))
+            .ok_or_else(|| rpc_err(-32002, "no such item"))?;
+        let path = if kind == "p" {
+            format!("/playlists/{id}")
+        } else {
+            format!("/library/metadata/{id}")
+        };
+        let (_, v) = self.get(&path, &[])?;
+        let m = &v["Metadata"][0];
+        if !m.is_object() {
+            return Err(rpc_err(-32002, "no such item"));
+        }
+        let fr = self.fr();
+        let mut out = json!({});
+        let bio = items::plain_text(m["summary"].as_str().unwrap_or(""));
+        if !bio.is_empty() {
+            out["biography"] = json!({"text": bio, "source": "Plex"});
+        }
+        // An artist's hubs are on its own key, an album's or a track's
+        // under `related`.
+        let hubs = match kind {
+            "r" => format!("/hubs/metadata/{id}"),
+            "a" | "t" => format!("/hubs/metadata/{id}/related"),
+            _ => String::new(),
+        };
+        let mut related = Vec::new();
+        if !hubs.is_empty() {
+            match self.get_optional(&hubs, &[("count", "20".to_string())]) {
+                // The artist's albums are its page already.
+                Ok((s, h)) => related = items::shelves(&s, &h, &["artist.albums"]),
+                Err(e) => eprintln!("hubs of {kind}/{id}: {}", e.message),
+            }
+        }
+        if kind == "r" && related.len() < 2 {
+            let has_similar = related.iter().any(|r| {
+                r["items"]
+                    .as_array()
+                    .is_some_and(|i| i.iter().any(|x| x["kind"] == "artist"))
+            });
+            if !has_similar {
+                match self.similar(id) {
+                    Ok(list) if !list.is_empty() => related.push(json!({
+                        "title": if fr { "Artistes similaires" } else { "Similar artists" },
+                        "items": list,
+                    })),
+                    Ok(_) => {}
+                    Err(e) => eprintln!("similar to r/{id}: {}", e.message),
+                }
+            }
+        }
+        if !related.is_empty() {
+            out["related"] = related.into();
+        }
+        let facts = items::facts(m, fr);
+        if !facts.is_empty() {
+            out["facts"] = facts.into();
+        }
+        Ok(out)
+    }
+
+    // ---------------------------------------------------------------- radio
+
+    /// Tracks to follow `id` (a track, album or artist), none of `exclude`
+    /// (refs): for a track, those that sound like it first; then, at
+    /// random, tracks of its artist and of similar artists.
+    fn radio(&self, id: &str, exclude: &[String], limit: usize) -> Result<Vec<Value>, RpcError> {
+        let (_, v) = self.get(&format!("/library/metadata/{id}"), &[])?;
+        let m = &v["Metadata"][0];
+        let mut seen: HashSet<String> = exclude.iter().cloned().collect();
+        let mut out = Vec::new();
+        let mut take = |list: Vec<Value>, out: &mut Vec<Value>| {
+            for t in list {
+                let r = t["ref"].as_str().unwrap_or("").to_string();
+                if out.len() < limit && t["playable"] == true && seen.insert(r) {
+                    out.push(t);
+                }
+            }
+        };
+        let artist = match m["type"].as_str() {
+            Some("track") => {
+                let want = limit + exclude.len() + 1;
+                let mut near = self.sonic(id, want.min(PAGE as usize))?;
+                near.retain(|t| t["ref"] != format!("t/{id}"));
+                take(near, &mut out);
+                &m["grandparentRatingKey"]
+            }
+            Some("album") => &m["parentRatingKey"],
+            Some("artist") => &m["ratingKey"],
+            _ => return Ok(out),
+        };
+        let Some(artist) = artist.as_str().filter(|_| out.len() < limit) else {
+            return Ok(out);
+        };
+        let mut ids = vec![artist.to_string()];
+        let (_, similar) = self.similar_raw(artist)?;
+        ids.extend(
+            similar
+                .iter()
+                .filter(|a| a["type"] == "artist")
+                .filter_map(|a| a["ratingKey"].as_str().map(str::to_string)),
+        );
+        let q = [
+            ("type", "10".to_string()),
+            ("artist.id", ids.join(",")),
+            ("sort", "random".to_string()),
+        ];
+        let size = (limit + exclude.len() + 1).min(PAGE as usize) as u64;
+        let (s, pg) = self.page("/library/all", &q, 0, size)?;
+        let mut list = items::many(&s, &pg.items, items::track);
+        if m["type"] == "track" {
+            list.retain(|t| t["ref"] != format!("t/{id}"));
+        }
+        take(list, &mut out);
+        Ok(out)
+    }
+
+    fn radio_next(&self, p: &Value) -> Reply {
+        let (_, id) = items::split_ref(p["seed"].as_str().unwrap_or(""))
+            .ok_or_else(|| rpc_err(-32602, "bad seed"))?;
+        let exclude: Vec<String> = p["exclude"]
+            .as_array()
+            .map(|a| {
+                a.iter()
+                    .filter_map(Value::as_str)
+                    .map(str::to_string)
+                    .collect()
+            })
+            .unwrap_or_default();
+        let limit = p["limit"].as_u64().unwrap_or(20).clamp(1, RADIO_MAX as u64) as usize;
+        Ok(json!({ "items": self.radio(id, &exclude, limit)? }))
+    }
+
+    // ------------------------------------------------------------ playlists
+
+    /// `server://<machine>/…/library/metadata/<ids>`: items of this server,
+    /// as playlists take them.
+    fn items_uri(&self, ids: &[&str]) -> Result<String, RpcError> {
+        let s = self.session()?;
+        let machine = if s.machine_id.is_empty() {
+            self.with(|s| self.client.identity(&s.server, &s.token))?
+        } else {
+            s.machine_id
+        };
+        Ok(format!(
+            "server://{machine}/{LIBRARY}/library/metadata/{}",
+            ids.join(",")
+        ))
+    }
+
+    /// The rating key of playlist `p["ref"]`, when the user may edit it.
+    fn editable_playlist(&self, p: &Value) -> Result<String, RpcError> {
+        let Some(("p", id)) = items::split_ref(p["ref"].as_str().unwrap_or("")) else {
+            return Err(rpc_err(-32602, "not a playlist"));
+        };
+        let (_, v) = self.get(&format!("/playlists/{id}"), &[])?;
+        if !items::editable(&v["Metadata"][0]) {
+            return Err(rpc_err(-32602, "this playlist cannot be edited"));
+        }
+        Ok(id.to_string())
+    }
+
+    fn name(p: &Value) -> Result<String, RpcError> {
+        let name = p["name"].as_str().unwrap_or("").trim();
+        if name.is_empty() {
+            return Err(rpc_err(-32602, "a playlist needs a name"));
+        }
+        Ok(name.to_string())
+    }
+
+    /// A change on the server, without an answer.
+    fn edit(&self, method: &str, path: &str, q: &[(&str, String)]) -> Reply {
+        self.with(|s| self.client.call(s, method, path, q))
+            .map(|_| Value::Null)
+    }
+
+    /// An empty audio playlist (Plex playlists are the user's own: no
+    /// public ones), with its description.
+    fn playlist_create(&self, p: &Value) -> Reply {
+        let name = Self::name(p)?;
+        let q = [
+            ("type", "audio".to_string()),
+            ("title", name),
+            ("smart", "0".to_string()),
+            ("uri", self.items_uri(&[])?),
+        ];
+        let (s, v) =
+            self.with(|s| Ok((s.clone(), self.client.request(s, "POST", "/playlists", &q)?)))?;
+        let mut pl = v["Metadata"][0].clone();
+        let id = pl["ratingKey"]
+            .as_str()
+            .map(str::to_string)
+            .ok_or_else(|| rpc_err(-32603, "the server did not create the playlist"))?;
+        if let Some(d) = p["description"]
+            .as_str()
+            .map(str::trim)
+            .filter(|d| !d.is_empty())
+        {
+            let q = [("summary", d.to_string())];
+            match self.edit("PUT", &format!("/playlists/{id}"), &q) {
+                Ok(_) => pl["summary"] = d.into(),
+                Err(e) => eprintln!("description of p/{id}: {}", e.message),
+            }
+        }
+        items::playlist(&s, &pl)
+            .ok_or_else(|| rpc_err(-32603, "the server did not create the playlist"))
+    }
+
+    fn playlist_rename(&self, p: &Value) -> Reply {
+        let name = Self::name(p)?;
+        let id = self.editable_playlist(p)?;
+        self.edit("PUT", &format!("/playlists/{id}"), &[("title", name)])
+    }
+
+    fn playlist_delete(&self, p: &Value) -> Reply {
+        let id = self.editable_playlist(p)?;
+        self.edit("DELETE", &format!("/playlists/{id}"), &[])
+    }
+
+    /// Tracks (or whole albums) at the end of the playlist.
+    fn playlist_add(&self, p: &Value) -> Reply {
+        let refs = p["items"].as_array().map(Vec::as_slice).unwrap_or_default();
+        let ids = refs
+            .iter()
+            .map(|r| match items::split_ref(r.as_str().unwrap_or("")) {
+                Some(("t" | "a", id)) => Ok(id),
+                _ => Err(rpc_err(-32602, "only tracks and albums go in a playlist")),
+            })
+            .collect::<Result<Vec<&str>, RpcError>>()?;
+        if ids.is_empty() {
+            return Err(rpc_err(-32602, "nothing to add"));
+        }
+        let id = self.editable_playlist(p)?;
+        let q = [("uri", self.items_uri(&ids)?)];
+        self.edit("PUT", &format!("/playlists/{id}/items"), &q)
+    }
+
+    /// Entries are `playlistItemID`s, as `entry_id` gives them.
+    fn playlist_remove(&self, p: &Value) -> Reply {
+        let entries = entries(&p["entries"])?;
+        let id = self.editable_playlist(p)?;
+        for e in entries {
+            self.edit("DELETE", &format!("/playlists/{id}/items/{e}"), &[])?;
+        }
+        Ok(Value::Null)
+    }
+
+    /// Plex moves an entry after another one: the one before index `to`.
+    fn playlist_move(&self, p: &Value) -> Reply {
+        let entry = entries(&json!([p["entry"]]))?.remove(0);
+        let to = p["to"]
+            .as_u64()
+            .ok_or_else(|| rpc_err(-32602, "no target position"))? as usize;
+        let id = self.editable_playlist(p)?;
+        let (_, pg) = self.page(&format!("/playlists/{id}/items"), &[], 0, PLAYLIST_MAX)?;
+        let list: Vec<String> = pg
+            .items
+            .iter()
+            .filter_map(|t| match &t["playlistItemID"] {
+                Value::Number(n) => Some(n.to_string()),
+                Value::String(s) => Some(s.clone()),
+                _ => None,
+            })
+            .collect();
+        let after = items::move_after(&list, &entry, to)
+            .ok_or_else(|| rpc_err(-32002, "no such entry in the playlist"))?;
+        let q: Vec<(&str, String)> = after.into_iter().map(|a| ("after", a)).collect();
+        self.edit("PUT", &format!("/playlists/{id}/items/{entry}/move"), &q)
+    }
+
     // ------------------------------------------------------------ reporting
 
     /// The timeline while a track plays (the server's "now playing" and
     /// resume point), and `/:/scrobble` once it counts as played: to its
     /// end, or half of it, or four minutes.
     fn report(&self, method: &str, p: &Value) {
+        if !self.settings.lock().unwrap().report {
+            return;
+        }
         let Ok(s) = self.session() else {
             return;
         };
@@ -918,9 +1347,38 @@ impl Plugin {
                 self.library(method, p)
             }
             "track.resolve" => self.resolve(p),
+            "lyrics.get" => self.lyrics(p),
+            "item.details" => self.details(p),
+            "radio.next" => self.radio_next(p),
+            "playlists.create" => self.playlist_create(p),
+            "playlists.rename" => self.playlist_rename(p),
+            "playlists.delete" => self.playlist_delete(p),
+            "playlists.add" => self.playlist_add(p),
+            "playlists.remove" => self.playlist_remove(p),
+            "playlists.move" => self.playlist_move(p),
             _ => Err(rpc_err(-32601, format!("method not found: {method}"))),
         }
     }
+}
+
+/// Playlist entries (`playlistItemID`s, numbers) from the host.
+fn entries(v: &Value) -> Result<Vec<String>, RpcError> {
+    let list: Vec<String> = v
+        .as_array()
+        .map(Vec::as_slice)
+        .unwrap_or_default()
+        .iter()
+        .map(|e| match e {
+            Value::String(s) => s.clone(),
+            Value::Number(n) => n.to_string(),
+            _ => String::new(),
+        })
+        .collect();
+    let ok = |e: &String| !e.is_empty() && e.len() <= 20 && e.bytes().all(|b| b.is_ascii_digit());
+    if list.is_empty() || !list.iter().all(ok) {
+        return Err(rpc_err(-32602, "bad playlist entries"));
+    }
+    Ok(list)
 }
 
 /// Write `text` to `path` with mode 600, atomically.
@@ -965,7 +1423,7 @@ fn main() {
         out: out.clone(),
         server_hint,
         data_dir: Mutex::new(std::env::temp_dir()),
-        french: Mutex::new(false),
+        settings: Mutex::new(Settings::from_json(&Value::Null)),
         output: Mutex::new(Output::default()),
         client: Arc::new(Client::new()),
         session: Mutex::new(None),
@@ -990,6 +1448,7 @@ fn main() {
                 "output.changed" => {
                     *plugin.output.lock().unwrap() = Output::from_json(&params["output"]);
                 }
+                "settings.changed" => plugin.apply_settings(&params["settings"]),
                 m if m.starts_with("playback.") => {
                     let plugin = plugin.clone();
                     std::thread::spawn(move || plugin.report(&method, &params));
@@ -1021,5 +1480,37 @@ fn main() {
         } else {
             std::thread::spawn(run);
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn settings() {
+        let d = Settings::from_json(&Value::Null);
+        assert!(d.report && d.transcode);
+        let s = Settings::from_json(&json!({"report_playback": false, "transcode": "never",
+                                            "gone": 1}));
+        assert!(!s.report && !s.transcode);
+        let odd = Settings::from_json(&json!({"report_playback": "no", "transcode": 3}));
+        assert_eq!(odd, d);
+        let decl = Settings::declare(true);
+        assert_eq!(decl[0]["key"], "report_playback");
+        assert_eq!(decl[0]["default"], true);
+        assert_eq!(decl[1]["default"], "auto");
+        assert_eq!(decl[1]["section"], "Lecture");
+    }
+
+    #[test]
+    fn playlist_entries() {
+        assert_eq!(
+            entries(&json!(["12", 13])).ok(),
+            Some(vec!["12".into(), "13".into()])
+        );
+        assert!(entries(&json!([])).is_err());
+        assert!(entries(&json!(["1/2"])).is_err());
+        assert!(entries(&json!([null])).is_err());
     }
 }
