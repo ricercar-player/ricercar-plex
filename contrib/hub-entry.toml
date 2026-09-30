@@ -14,9 +14,9 @@ capabilities = ["auth", "browse", "search", "resolve", "favorites", "reporting",
 [[assets]]
 arch = "x86_64"
 url = "https://github.com/ricercar-player/ricercar-plex/releases/download/v0.3.0/plex-x86_64"
-sha256 = "d88bbd9f0f7778a74aa94f6b19eceb019685889838fcb9edd8921faaec6e7d28"
+sha256 = "930bb2d9bc9d9020db288b162fd9fbd8c07ecc7d65e4b4e2b4da3e1f23cce386"
 
 [[assets]]
 arch = "aarch64"
 url = "https://github.com/ricercar-player/ricercar-plex/releases/download/v0.3.0/plex-aarch64"
-sha256 = "2e80e58711ee2af67a7ff0b102a0662ef6d0c357e9632e955f35a88b7eec508a"
+sha256 = "68714b780ec384249fd2aa77e3c8309606900cdf723fef610a6a09c9dbffe5f7"
