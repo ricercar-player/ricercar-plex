@@ -218,6 +218,12 @@ fr = p.call("browse.list", {"ref": "frequent", "offset": 0, "limit": 10}); check
 for shelf in ("played", "top"):
     sh = p.call("browse.list", {"ref": shelf, "offset": 0, "limit": 10})
     check(sh["items"] and sh["items"][0]["ref"] == sess["ref"] and all(x["kind"] == "album" for x in sh["items"]), "home shelf %s: %s" % (shelf, [x["title"] for x in sh["items"]]))
+# the host's language changes: labels follow, the settings are declared again
+p.notify("locale.changed", {"locale": "en-US"})
+n = p.notes.get(timeout=5)
+while n["method"] != "settings.declared": n = p.notes.get(timeout=5)
+check(n["params"]["settings"][0]["label"] == "Report what I play" and len(n["params"]["settings"]) == 2, "locale.changed: settings declared in English")
+check(p.call("browse.root")["sections"][0]["title"] == "Recently added" and p.call("item.get", {"ref": t1["ref"]})["actions"][0]["label"] == "Sonically similar tracks", "locale.changed: labels in English")
 p.call("shutdown")
 # restart: session restored
 p = P(); p.call("initialize", {"protocol": 1, "data_dir": DATA, "locale": "en", "output": OUT})

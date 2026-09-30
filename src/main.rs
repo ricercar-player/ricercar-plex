@@ -19,7 +19,7 @@ mod plex;
 use std::collections::{HashMap, HashSet};
 use std::io::{BufRead, BufReader, Read, Write};
 use std::path::PathBuf;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, mpsc};
 use std::time::{Duration, Instant};
 
 use serde_json::{Value, json};
@@ -162,6 +162,19 @@ impl Plugin {
         items::french()
     }
 
+    /// The user switched the host's language: labels follow from now on,
+    /// the settings dialog too.
+    fn set_locale(&self, locale: &Value) {
+        let fr = is_french(locale);
+        if fr != self.fr() {
+            items::set_french(fr);
+            self.out.notify(
+                "settings.declared",
+                json!({ "settings": Settings::declare(fr) }),
+            );
+        }
+    }
+
     fn apply_settings(&self, v: &Value) {
         let new = Settings::from_json(v);
         if !new.report {
@@ -297,7 +310,7 @@ impl Plugin {
             .map(PathBuf::from)
             .unwrap_or_else(std::env::temp_dir);
         let _ = std::fs::create_dir_all(&data_dir);
-        items::set_french(p["locale"].as_str().is_some_and(|l| l.starts_with("fr")));
+        items::set_french(is_french(&p["locale"]));
         *self.output.lock().unwrap() = Output::from_json(&p["output"]);
         self.apply_settings(&p["settings"]);
         // Plex lists each client identifier among the account's devices:
@@ -1361,6 +1374,11 @@ impl Plugin {
     }
 }
 
+/// A `locale` of the host ("fr-FR", "fr"…) asks for French labels.
+fn is_french(locale: &Value) -> bool {
+    locale.as_str().is_some_and(|l| l.starts_with("fr"))
+}
+
 /// Playlist entries (`playlistItemID`s, numbers) from the host.
 fn entries(v: &Value) -> Result<Vec<String>, RpcError> {
     let list: Vec<String> = v
@@ -1433,6 +1451,19 @@ fn main() {
         playing: Mutex::new(HashMap::new()),
     });
 
+    // Playback reports in the order they came, off the reading loop: an
+    // `ended` must not overtake the `started` it follows.
+    let reports = {
+        let (tx, rx) = mpsc::channel::<(String, Value)>();
+        let plugin = plugin.clone();
+        std::thread::spawn(move || {
+            for (method, params) in rx {
+                plugin.report(&method, &params);
+            }
+        });
+        tx
+    };
+
     for line in BufReader::new(std::io::stdin()).lines() {
         let Ok(line) = line else { break };
         let Ok(msg) = serde_json::from_str::<Value>(&line) else {
@@ -1449,9 +1480,9 @@ fn main() {
                     *plugin.output.lock().unwrap() = Output::from_json(&params["output"]);
                 }
                 "settings.changed" => plugin.apply_settings(&params["settings"]),
+                "locale.changed" => plugin.set_locale(&params["locale"]),
                 m if m.starts_with("playback.") => {
-                    let plugin = plugin.clone();
-                    std::thread::spawn(move || plugin.report(&method, &params));
+                    let _ = reports.send((method, params));
                 }
                 _ => {}
             }
@@ -1501,6 +1532,12 @@ mod tests {
         assert_eq!(decl[0]["default"], true);
         assert_eq!(decl[1]["default"], "auto");
         assert_eq!(decl[1]["section"], "Lecture");
+    }
+
+    #[test]
+    fn locales() {
+        assert!(is_french(&json!("fr-FR")) && is_french(&json!("fr")));
+        assert!(!is_french(&json!("en-US")) && !is_french(&Value::Null));
     }
 
     #[test]
